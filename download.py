@@ -43,6 +43,9 @@ def parse_conversation(raw_body: str) -> dict:
     title = meta[1] if meta and len(meta) > 1 and isinstance(meta[1], str) else "Untitled"
     share_id = conv_data[3] if len(conv_data) > 3 else "unknown"
 
+    if not turns_raw:
+        raise ValueError("No turns found in conversation data")
+
     messages = []
     for i, turn in enumerate(turns_raw):
         try:
@@ -72,8 +75,7 @@ def parse_conversation(raw_body: str) -> dict:
                     "model": model_text,
                 })
         except Exception as e:
-            # Skip malformed turns
-            pass
+            print(f"[!] Skipping malformed turn {i}: {e}", file=sys.stderr)
 
     return {
         "title": title,
@@ -114,35 +116,42 @@ async def download_chat(url: str, output_path: str = None, fmt: str = "md") -> d
     print(f"[+] Loading: {url}", file=sys.stderr)
 
     conversation_body = None
+    api_received = asyncio.Event()
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
+        try:
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                )
             )
-        )
-        page = await context.new_page()
+            page = await context.new_page()
 
-        async def on_response(response):
-            nonlocal conversation_body
-            if "batchexecute" in response.url and "ujx1Bf" in response.url:
-                try:
-                    body = await response.text()
-                    # Keep the largest response (the full conversation)
-                    if conversation_body is None or len(body) > len(conversation_body):
-                        conversation_body = body
-                except Exception:
-                    pass
+            async def on_response(response):
+                nonlocal conversation_body
+                if "batchexecute" in response.url and "ujx1Bf" in response.url:
+                    try:
+                        body = await response.text()
+                        # Keep the largest response (the full conversation)
+                        if conversation_body is None or len(body) > len(conversation_body):
+                            conversation_body = body
+                            api_received.set()
+                    except Exception:
+                        pass
 
-        page.on("response", on_response)
+            page.on("response", on_response)
 
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        # Wait for the conversation API call to complete
-        await page.wait_for_timeout(8000)
-        await browser.close()
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            # Wait for the conversation API call, with a 15s timeout fallback
+            try:
+                await asyncio.wait_for(api_received.wait(), timeout=15)
+            except asyncio.TimeoutError:
+                pass  # proceed and let the None check below raise a clear error
+        finally:
+            await browser.close()
 
     if not conversation_body:
         raise RuntimeError("No conversation data captured. The URL may be invalid or expired.")
