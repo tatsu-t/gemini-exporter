@@ -29,7 +29,10 @@ def parse_conversation(raw_body: str) -> dict:
         raise ValueError("Could not find JSON data in response")
 
     outer = json.loads(json_line)
-    inner_str = outer[0][2]
+    try:
+        inner_str = outer[0][2]
+    except (IndexError, TypeError):
+        raise ValueError("Unexpected API response structure")
     if not inner_str:
         raise ValueError("No conversation data in response (inner_str is empty)")
 
@@ -199,7 +202,14 @@ def main():
     if output and output.endswith(".json"):
         fmt = "json"
 
-    asyncio.run(download_chat(url, output, fmt))
+    try:
+        asyncio.run(download_chat(url, output, fmt))
+    except (ValueError, RuntimeError) as e:
+        print(f"[ERROR] {e}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\n[!] Cancelled", file=sys.stderr)
+        sys.exit(130)
 
 
 if __name__ == "__main__":
