@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Gemini Share Chat Downloader
-Usage: python download.py [--no-images] <gemini_share_url> [output_file]
+Usage: python download.py [--no-dl] <gemini_share_url> [output_file]
 Example: python download.py https://gemini.google.com/share/49fb916f92a0
 """
 
@@ -19,7 +19,29 @@ MIME_TO_EXT = {
     "image/jpeg": ".jpg",
     "image/webp": ".webp",
     "image/gif": ".gif",
+    "image/svg+xml": ".svg",
+    "application/pdf": ".pdf",
+    "text/plain": ".txt",
+    "text/csv": ".csv",
+    "text/html": ".html",
+    "application/json": ".json",
+    "application/zip": ".zip",
+    "audio/mpeg": ".mp3",
+    "audio/wav": ".wav",
+    "video/mp4": ".mp4",
 }
+
+
+def _ext_from_mime(mime: str | None) -> str:
+    """Get file extension from MIME type."""
+    if not mime:
+        return ".bin"
+    if mime in MIME_TO_EXT:
+        return MIME_TO_EXT[mime]
+    # fallback: image/anything -> use subtype, else .bin
+    if mime.startswith("image/"):
+        return f".{mime.split('/')[1]}"
+    return ".bin"
 
 
 def _extract_attachments(user_msg_parts: list) -> list[dict]:
@@ -130,15 +152,15 @@ def parse_conversation(raw_body: str) -> dict:
     }
 
 
-async def download_images(messages: list, image_dir: Path) -> None:
-    """Download all attachments to image_dir, updating each attachment dict
-    with a 'local_path' key pointing to the saved file."""
+async def download_attachments(messages: list, att_dir: Path) -> None:
+    """Download all attachments to att_dir, updating each attachment dict
+    with 'local_path' and 'filename' keys."""
     to_download = []
     for msg in messages:
         for j, att in enumerate(msg.get("attachments", [])):
-            ext = MIME_TO_EXT.get(att.get("mime"), ".png")
+            ext = _ext_from_mime(att.get("mime"))
             filename = f"turn{msg['index']:03d}_{j}{ext}"
-            dest = image_dir / filename
+            dest = att_dir / filename
             att["local_path"] = str(dest)
             att["filename"] = filename
             to_download.append((att["url"], dest))
@@ -146,11 +168,11 @@ async def download_images(messages: list, image_dir: Path) -> None:
     if not to_download:
         return
 
-    image_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[+] Downloading {len(to_download)} images...", file=sys.stderr)
+    att_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[+] Downloading {len(to_download)} attachments...", file=sys.stderr)
 
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        for i, (url, dest) in enumerate(to_download):
+        for url, dest in to_download:
             try:
                 resp = await client.get(url)
                 resp.raise_for_status()
@@ -159,10 +181,10 @@ async def download_images(messages: list, image_dir: Path) -> None:
                 print(f"[!] Failed to download {dest.name}: {e}", file=sys.stderr)
 
     downloaded = sum(1 for _, d in to_download if d.exists())
-    print(f"[+] Downloaded {downloaded}/{len(to_download)} images", file=sys.stderr)
+    print(f"[+] Downloaded {downloaded}/{len(to_download)} attachments", file=sys.stderr)
 
 
-def conversation_to_markdown(conv: dict, image_dir_name: str = None) -> str:
+def conversation_to_markdown(conv: dict, att_dir_name: str = None) -> str:
     """Convert parsed conversation to Markdown format."""
     lines = []
     lines.append(f"# {conv['title']}")
@@ -171,13 +193,27 @@ def conversation_to_markdown(conv: dict, image_dir_name: str = None) -> str:
     lines.append("---\n")
 
     for msg in conv["messages"]:
-        if msg["user"]:
-            lines.append(f"**user:**\n\n{msg['user']}\n")
+        # Build user block: file labels first, then text
+        user_lines = []
         for att in msg.get("attachments", []):
-            if image_dir_name and att.get("filename"):
-                lines.append(f"![{att['filename']}]({image_dir_name}/{att['filename']})\n")
+            display_name = att.get("filename") or att.get("original_name") or "file"
+            user_lines.append(f"file:{display_name}")
+        if msg["user"]:
+            user_lines.append(msg["user"])
+
+        if user_lines:
+            lines.append(f"**user:**\n\n" + "\n".join(user_lines) + "\n")
+
+        # Embed images in markdown
+        for att in msg.get("attachments", []):
+            mime = att.get("mime") or ""
+            if not mime.startswith("image/"):
+                continue
+            if att_dir_name and att.get("filename"):
+                lines.append(f"![{att['filename']}]({att_dir_name}/{att['filename']})\n")
             else:
                 lines.append(f"![image]({att['url']})\n")
+
         if msg["model"]:
             lines.append(f"**Gemini:**\n\n{msg['model']}\n")
         lines.append("---\n")
@@ -194,7 +230,7 @@ async def download_chat(
     url: str,
     output_path: str = None,
     fmt: str = "md",
-    save_images: bool = True,
+    download_files: bool = True,
 ) -> dict:
     """Download a Gemini shared chat conversation."""
 
@@ -245,10 +281,10 @@ async def download_chat(
     print("[+] Parsing conversation...", file=sys.stderr)
     conv = parse_conversation(conversation_body)
 
-    image_count = sum(len(m.get("attachments", [])) for m in conv["messages"])
+    att_count = sum(len(m.get("attachments", [])) for m in conv["messages"])
     print(
         f"[+] Found {len(conv['messages'])} messages, "
-        f"{image_count} images: \"{conv['title']}\"",
+        f"{att_count} attachments: \"{conv['title']}\"",
         file=sys.stderr,
     )
 
@@ -262,18 +298,18 @@ async def download_chat(
 
     output_p = Path(output_path)
 
-    # Download images
-    image_dir_name = None
-    if save_images and image_count > 0:
-        image_dir = output_p.with_suffix("") / "images"
-        image_dir_name = f"{output_p.stem}/images"
-        await download_images(conv["messages"], image_dir)
+    # Download attachments
+    att_dir_name = None
+    if download_files and att_count > 0:
+        att_dir = output_p.with_suffix("") / "attachments"
+        att_dir_name = f"{output_p.stem}/attachments"
+        await download_attachments(conv["messages"], att_dir)
 
     # Write output
     if output_path.endswith(".json") or fmt == "json":
         content = conversation_to_json(conv)
     else:
-        content = conversation_to_markdown(conv, image_dir_name)
+        content = conversation_to_markdown(conv, att_dir_name)
 
     output_p.write_text(content, encoding="utf-8")
     print(f"[+] Saved to: {output_path}", file=sys.stderr)
@@ -287,10 +323,10 @@ def main():
         sys.exit(1)
 
     args = sys.argv[1:]
-    save_images = True
-    if "--no-images" in args:
-        save_images = False
-        args.remove("--no-images")
+    download_files = True
+    if "--no-dl" in args:
+        download_files = False
+        args.remove("--no-dl")
 
     if not args:
         print(__doc__)
@@ -304,7 +340,7 @@ def main():
         fmt = "json"
 
     try:
-        asyncio.run(download_chat(url, output, fmt, save_images))
+        asyncio.run(download_chat(url, output, fmt, download_files))
     except (ValueError, RuntimeError) as e:
         print(f"[ERROR] {e}", file=sys.stderr)
         sys.exit(1)
