@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Gemini Share Chat Downloader
-Usage: python download.py <gemini_share_url> [output_file]
+Usage: python download.py [--no-images] <gemini_share_url> [output_file]
 Example: python download.py https://gemini.google.com/share/49fb916f92a0
 """
 
@@ -10,15 +10,53 @@ import json
 import re
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
+import httpx
 from playwright.async_api import async_playwright
+
+MIME_TO_EXT = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
+
+
+def _extract_attachments(user_msg_parts: list) -> list[dict]:
+    """Extract attachment info from user message parts.
+
+    Attachments live at user_msg_parts[4] as a list of groups,
+    each group having a file list at index [3].
+    """
+    attachments = []
+    if len(user_msg_parts) <= 4 or not user_msg_parts[4]:
+        return attachments
+
+    for group in user_msg_parts[4]:
+        if not group or len(group) <= 3 or not group[3]:
+            continue
+        for file_entry in group[3]:
+            try:
+                url = file_entry[3] if len(file_entry) > 3 else None
+                mime = file_entry[11] if len(file_entry) > 11 else None
+                filename = file_entry[2] if len(file_entry) > 2 else None
+                if url and isinstance(url, str) and url.startswith("http"):
+                    attachments.append({
+                        "url": url,
+                        "mime": mime,
+                        "original_name": filename,
+                    })
+            except (IndexError, TypeError):
+                continue
+
+    return attachments
 
 
 def parse_conversation(raw_body: str) -> dict:
     """Parse the batchexecute response body into a structured conversation."""
     lines = raw_body.split("\n")
 
-    # Format: )]}'\n\n<length>\n<json>\n...
     json_line = None
     for line in lines:
         if line.startswith("[["):
@@ -45,9 +83,8 @@ def parse_conversation(raw_body: str) -> dict:
     if len(conv_data) < 2:
         raise ValueError("Unexpected conversation structure (missing turns)")
 
-    turns_raw = conv_data[1]  # list of all turns
+    turns_raw = conv_data[1]
 
-    # Extract title and share_id
     meta = conv_data[2] if len(conv_data) > 2 and conv_data[2] else None
     title = meta[1] if meta and len(meta) > 1 and isinstance(meta[1], str) else "Untitled"
     share_id = conv_data[3] if len(conv_data) > 3 else "unknown"
@@ -58,13 +95,13 @@ def parse_conversation(raw_body: str) -> dict:
     messages = []
     for i, turn in enumerate(turns_raw):
         try:
-            # User message: turn[2][0][0] is the text
             user_parts = turn[2][0] if turn[2] and turn[2][0] else []
             user_text = user_parts[0] if user_parts else ""
             if not isinstance(user_text, str):
                 user_text = str(user_text)
 
-            # Model response: turn[3][0][0][1] is list of text chunks
+            attachments = _extract_attachments(user_parts)
+
             model_text = ""
             if turn[3] and turn[3][0] and turn[3][0][0]:
                 candidate = turn[3][0][0]
@@ -82,6 +119,7 @@ def parse_conversation(raw_body: str) -> dict:
                     "index": i,
                     "user": user_text,
                     "model": model_text,
+                    "attachments": attachments,
                 })
         except Exception as e:
             print(f"[!] Skipping malformed turn {i}: {e}", file=sys.stderr)
@@ -93,7 +131,39 @@ def parse_conversation(raw_body: str) -> dict:
     }
 
 
-def conversation_to_markdown(conv: dict) -> str:
+async def download_images(messages: list, image_dir: Path) -> None:
+    """Download all attachments to image_dir, updating each attachment dict
+    with a 'local_path' key pointing to the saved file."""
+    to_download = []
+    for msg in messages:
+        for j, att in enumerate(msg.get("attachments", [])):
+            ext = MIME_TO_EXT.get(att.get("mime"), ".png")
+            filename = f"turn{msg['index']:03d}_{j}{ext}"
+            dest = image_dir / filename
+            att["local_path"] = str(dest)
+            att["filename"] = filename
+            to_download.append((att["url"], dest))
+
+    if not to_download:
+        return
+
+    image_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[+] Downloading {len(to_download)} images...", file=sys.stderr)
+
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        for i, (url, dest) in enumerate(to_download):
+            try:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                dest.write_bytes(resp.content)
+            except Exception as e:
+                print(f"[!] Failed to download {dest.name}: {e}", file=sys.stderr)
+
+    downloaded = sum(1 for _, d in to_download if d.exists())
+    print(f"[+] Downloaded {downloaded}/{len(to_download)} images", file=sys.stderr)
+
+
+def conversation_to_markdown(conv: dict, image_dir_name: str = None) -> str:
     """Convert parsed conversation to Markdown format."""
     lines = []
     lines.append(f"# {conv['title']}")
@@ -104,6 +174,11 @@ def conversation_to_markdown(conv: dict) -> str:
     for msg in conv["messages"]:
         if msg["user"]:
             lines.append(f"**user:**\n\n{msg['user']}\n")
+        for att in msg.get("attachments", []):
+            if image_dir_name and att.get("filename"):
+                lines.append(f"![{att['filename']}]({image_dir_name}/{att['filename']})\n")
+            else:
+                lines.append(f"![image]({att['url']})\n")
         if msg["model"]:
             lines.append(f"**Gemini:**\n\n{msg['model']}\n")
         lines.append("---\n")
@@ -116,7 +191,12 @@ def conversation_to_json(conv: dict) -> str:
     return json.dumps(conv, ensure_ascii=False, indent=2)
 
 
-async def download_chat(url: str, output_path: str = None, fmt: str = "md") -> dict:
+async def download_chat(
+    url: str,
+    output_path: str = None,
+    fmt: str = "md",
+    save_images: bool = True,
+) -> dict:
     """Download a Gemini shared chat conversation."""
 
     if not re.fullmatch(r"https://gemini\.google\.com/share/[a-zA-Z0-9]+", url):
@@ -144,7 +224,6 @@ async def download_chat(url: str, output_path: str = None, fmt: str = "md") -> d
                 if "batchexecute" in response.url and "ujx1Bf" in response.url:
                     try:
                         body = await response.text()
-                        # Keep the largest response (the full conversation)
                         if conversation_body is None or len(body) > len(conversation_body):
                             conversation_body = body
                             api_received.set()
@@ -154,11 +233,10 @@ async def download_chat(url: str, output_path: str = None, fmt: str = "md") -> d
             page.on("response", on_response)
 
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            # Wait for the conversation API call, with a 15s timeout fallback
             try:
                 await asyncio.wait_for(api_received.wait(), timeout=15)
             except asyncio.TimeoutError:
-                pass  # proceed and let the None check below raise a clear error
+                pass
         finally:
             await browser.close()
 
@@ -167,7 +245,13 @@ async def download_chat(url: str, output_path: str = None, fmt: str = "md") -> d
 
     print("[+] Parsing conversation...", file=sys.stderr)
     conv = parse_conversation(conversation_body)
-    print(f"[+] Found {len(conv['messages'])} messages: \"{conv['title']}\"", file=sys.stderr)
+
+    image_count = sum(len(m.get("attachments", [])) for m in conv["messages"])
+    print(
+        f"[+] Found {len(conv['messages'])} messages, "
+        f"{image_count} images: \"{conv['title']}\"",
+        file=sys.stderr,
+    )
 
     # Determine output path
     if not output_path:
@@ -177,13 +261,22 @@ async def download_chat(url: str, output_path: str = None, fmt: str = "md") -> d
         ext = fmt if fmt in ("md", "json") else "md"
         output_path = f"{safe_title}.{ext}"
 
+    output_p = Path(output_path)
+
+    # Download images
+    image_dir_name = None
+    if save_images and image_count > 0:
+        image_dir = output_p.with_suffix("") / "images"
+        image_dir_name = f"{output_p.stem}/images"
+        await download_images(conv["messages"], image_dir)
+
     # Write output
     if output_path.endswith(".json") or fmt == "json":
         content = conversation_to_json(conv)
     else:
-        content = conversation_to_markdown(conv)
+        content = conversation_to_markdown(conv, image_dir_name)
 
-    Path(output_path).write_text(content, encoding="utf-8")
+    output_p.write_text(content, encoding="utf-8")
     print(f"[+] Saved to: {output_path}", file=sys.stderr)
 
     return conv
@@ -194,16 +287,21 @@ def main():
         print(__doc__)
         sys.exit(1)
 
-    url = sys.argv[1]
-    output = sys.argv[2] if len(sys.argv) > 2 else None
+    args = sys.argv[1:]
+    save_images = True
+    if "--no-images" in args:
+        save_images = False
+        args.remove("--no-images")
 
-    # Detect format from output filename
+    url = args[0]
+    output = args[1] if len(args) > 1 else None
+
     fmt = "md"
     if output and output.endswith(".json"):
         fmt = "json"
 
     try:
-        asyncio.run(download_chat(url, output, fmt))
+        asyncio.run(download_chat(url, output, fmt, save_images))
     except (ValueError, RuntimeError) as e:
         print(f"[ERROR] {e}", file=sys.stderr)
         sys.exit(1)

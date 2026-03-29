@@ -1,18 +1,18 @@
 # gemini-exporter
 
-Download Gemini shared chat conversations to Markdown or JSON.
+Download Gemini shared chat conversations to Markdown or JSON, with image attachments.
 
 ## Requirements
 
 ```bash
-pip install playwright
+pip install playwright httpx
 python -m playwright install chromium
 ```
 
 ## Usage
 
 ```bash
-# Save as Markdown (default, auto-named from conversation title)
+# Save as Markdown with images (default)
 python download.py https://gemini.google.com/share/XXXXXXXXXX
 
 # Specify output file
@@ -20,29 +20,26 @@ python download.py https://gemini.google.com/share/XXXXXXXXXX output.md
 
 # Save as JSON
 python download.py https://gemini.google.com/share/XXXXXXXXXX output.json
+
+# Skip image download
+python download.py --no-images https://gemini.google.com/share/XXXXXXXXXX
 ```
 
-## Output example (Markdown)
+## Output structure
 
-```markdown
-# Conversation Title
-
-**Share URL:** https://gemini.google.com/share/XXXXXXXXXX
-**Messages:** 42
-
----
-
-**user:**
-
-your question here
-
-**Gemini:**
-
-Gemini's response here
-
----
 ```
+output.md
+output/
+  images/
+    turn003_0.png
+    turn005_0.png
+    turn005_1.png
+    ...
+```
+
+Images are referenced as relative paths in the Markdown file.
+When `--no-images` is used, images are linked by their original URLs instead.
 
 ## How it works
 
-Playwright loads the share page and intercepts the internal `batchexecute` API call that delivers the full conversation data. The nested JSON is parsed to extract all user and model turns.
+Playwright loads the share page and intercepts the internal `batchexecute` API call that delivers the full conversation data. The nested JSON is parsed to extract all user/model turns and image attachments.
