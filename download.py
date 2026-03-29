@@ -35,7 +35,13 @@ def parse_conversation(raw_body: str) -> dict:
 
     inner = json.loads(inner_str)
 
+    if not inner or not isinstance(inner[0], list):
+        raise ValueError("Unexpected conversation structure")
+
     conv_data = inner[0]
+    if len(conv_data) < 2:
+        raise ValueError("Unexpected conversation structure (missing turns)")
+
     turns_raw = conv_data[1]  # list of all turns
 
     # Extract title and share_id
@@ -110,7 +116,7 @@ def conversation_to_json(conv: dict) -> str:
 async def download_chat(url: str, output_path: str = None, fmt: str = "md") -> dict:
     """Download a Gemini shared chat conversation."""
 
-    if not re.match(r"https://gemini\.google\.com/share/[a-zA-Z0-9]+", url):
+    if not re.fullmatch(r"https://gemini\.google\.com/share/[a-zA-Z0-9]+", url):
         raise ValueError(f"Invalid Gemini share URL: {url}")
 
     print(f"[+] Loading: {url}", file=sys.stderr)
@@ -139,8 +145,8 @@ async def download_chat(url: str, output_path: str = None, fmt: str = "md") -> d
                         if conversation_body is None or len(body) > len(conversation_body):
                             conversation_body = body
                             api_received.set()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"[!] Failed to read API response: {e}", file=sys.stderr)
 
             page.on("response", on_response)
 
@@ -162,7 +168,9 @@ async def download_chat(url: str, output_path: str = None, fmt: str = "md") -> d
 
     # Determine output path
     if not output_path:
-        safe_title = re.sub(r'[\\/:*?"<>|]', "_", conv["title"])[:60]
+        safe_title = re.sub(r'[\\/:*?"<>|]', "_", conv["title"])[:60].strip()
+        if not safe_title:
+            safe_title = conv["share_id"]
         ext = fmt if fmt in ("md", "json") else "md"
         output_path = f"{safe_title}.{ext}"
 
