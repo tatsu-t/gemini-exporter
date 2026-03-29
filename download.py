@@ -10,7 +10,6 @@ import json
 import re
 import sys
 from pathlib import Path
-from urllib.parse import urlparse
 
 import httpx
 from playwright.async_api import async_playwright
@@ -114,7 +113,7 @@ def parse_conversation(raw_body: str) -> dict:
                     elif isinstance(chunks, str):
                         model_text = chunks
 
-            if user_text or model_text:
+            if user_text or model_text or attachments:
                 messages.append({
                     "index": i,
                     "user": user_text,
@@ -292,6 +291,10 @@ def main():
     if "--no-images" in args:
         save_images = False
         args.remove("--no-images")
+
+    if not args:
+        print(__doc__)
+        sys.exit(1)
 
     url = args[0]
     output = args[1] if len(args) > 1 else None
